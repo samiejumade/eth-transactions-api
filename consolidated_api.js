@@ -2,14 +2,36 @@ const express = require('express');
 const { ethers } = require('ethers');
 const Web3 = require('web3');
 const moment = require('moment');
+const cors = require('cors');
+const fs = require('fs').promises;
+const path = require('path');
 
 const app = express();
 const port = process.env.PORT || 3000;
+app.use(cors());
 
 // Connect to your local Hyperledger Besu node
 const web3 = new Web3('http://10.7.0.30:8545');
 
 app.use(express.json());
+
+// Cache file path
+const CACHE_FILE_PATH = path.join(__dirname, 'token_data_cache.json');
+const UPDATE_INTERVAL = 2 * 60 * 1000; // 2 minutes
+
+// Configuration
+const CONFIG = {
+  universalContract: '0xd95CA891eCfF265ACf2177651965a85d3B9F9a96',
+  woxAddress: '0x2a85A14cB9Fefdf55f2Bb8550FEAe8f1C8595697'
+};
+
+// Global cache object
+let dataCache = {
+  tokenGraphs: null,
+  lastUpdated: null,
+  isUpdating: false
+};
+
 
 // Helper function to get provider
 function getProvider() {
@@ -354,6 +376,116 @@ async function getTokenBalances(userAddress, tokenAddresses) {
   return balances;
 }
 
+
+// Background service to continuously update data
+async function updateDataInBackground() {
+  if (dataCache.isUpdating) {
+    console.log(`⏳ Update already in progress, skipping...`);
+    return;
+  }
+
+  console.log(`🔄 [${new Date().toISOString()}] Starting background data update...`);
+  dataCache.isUpdating = true;
+
+  try {
+    // Step 1: Get all swap events
+    console.log(`📊 Fetching swap events from blockchain...`);
+    const swapEvents = await getAllUniversalSwapEvents(CONFIG.universalContract);
+    console.log(`✅ Found ${swapEvents.length} swap events`);
+    
+    // Step 2: Generate price timeline
+    console.log(`💰 Generating price timeline...`);
+    const tokenPrices = generateTokenPriceTimeline(swapEvents, CONFIG.woxAddress);
+    console.log(`✅ Generated price data for ${Object.keys(tokenPrices).length} tokens`);
+    
+    // Step 3: Update cache
+    dataCache.tokenGraphs = {
+      priceHistory: tokenPrices,
+      eventCount: swapEvents.length,
+      tokenCount: Object.keys(tokenPrices).length
+    };
+    
+    dataCache.lastUpdated = new Date().toISOString();
+    dataCache.isUpdating = false;
+    
+    // Step 4: Save to file
+    await fs.writeFile(CACHE_FILE_PATH, JSON.stringify({
+      tokenGraphs: dataCache.tokenGraphs,
+      lastUpdated: dataCache.lastUpdated
+    }, null, 2));
+    
+    console.log(`💾 [${dataCache.lastUpdated}] Data updated and saved to file successfully`);
+    
+  } catch (error) {
+    console.error(`❌ Error updating data:`, error.message);
+    dataCache.isUpdating = false;
+  }
+}
+
+// Load data from file on startup
+async function loadDataFromFile() {
+  try {
+    const fileData = await fs.readFile(CACHE_FILE_PATH, 'utf8');
+    const parsedData = JSON.parse(fileData);
+    
+    if (parsedData.tokenGraphs && parsedData.lastUpdated) {
+      dataCache.tokenGraphs = parsedData.tokenGraphs;
+      dataCache.lastUpdated = parsedData.lastUpdated;
+      console.log(`✅ Data loaded from file. Last updated: ${dataCache.lastUpdated}`);
+      return true;
+    }
+  } catch (error) {
+    console.log(`⚠️  No existing cache file found: ${error.message}`);
+  }
+  return false;
+}
+
+// SIMPLIFIED TOKEN-GRAPHS ENDPOINT - Just serve from file
+app.get('/token-graphs', async (req, res) => {
+  try {
+    console.log(`📥 [${new Date().toISOString()}] Token graphs request - serving from cache`);
+    
+    // If no data in memory, try to load from file
+    if (!dataCache.tokenGraphs) {
+      await loadDataFromFile();
+    }
+    
+    // If still no data, return error
+    if (!dataCache.tokenGraphs) {
+      return res.status(503).json({
+        error: 'Data not available yet. Please try again in a few moments.',
+        message: 'Background service is still loading initial data.'
+      });
+    }
+    
+    // Calculate cache age
+    const cacheAge = Date.now() - new Date(dataCache.lastUpdated).getTime();
+    const cacheAgeMinutes = Math.round(cacheAge / 1000 / 60);
+    
+    // Return data from cache/file (FAST!)
+    const response = {
+      ...dataCache.tokenGraphs,
+      cacheInfo: {
+        lastUpdated: dataCache.lastUpdated,
+        cacheAgeMinutes: cacheAgeMinutes,
+        servedFrom: 'cache'
+      }
+    };
+    
+    console.log(`📤 Data served instantly (${cacheAgeMinutes} minutes old)`);
+    return res.json(response);
+    
+  } catch (error) {
+    console.error('❌ Error serving token graphs:', error);
+    return res.status(500).json({
+      error: 'Failed to get token graphs data',
+      details: error.message
+    });
+  }
+});
+
+
+
 // Endpoint to get token balances for a user
 app.post('/token-balances', async (req, res) => {
   const { tokenAddresses, userAddress } = req.body;
@@ -393,62 +525,6 @@ app.post('/token-balances', async (req, res) => {
   }
 });
 
-// Main endpoint that combines both functions
-app.get('/token-graphs', async (req, res) => {
-  try {
-    // Get parameters from query string
-    const universalContractAddress = req.query.universalContract || '0xd95CA891eCfF265ACf2177651965a85d3B9F9a96';
-    const woxAddress = req.query.woxAddress || '0xb9A219631Aed55eBC3D998f17C3840B7eC39C0cc';
-    
-    // Validate addresses
-    if (!ethers.isAddress(universalContractAddress)) {
-      return res.status(400).json({ error: 'Invalid universal contract address' });
-    }
-    
-    if (!ethers.isAddress(woxAddress)) {
-      return res.status(400).json({ error: 'Invalid WOX token address' });
-    }
-    
-    console.log(`Processing request for universal contract: ${universalContractAddress}, WOX token: ${woxAddress}`);
-    
-    // Step 1: Get all swap events from the universal contract
-    const swapEvents = await getAllUniversalSwapEvents(universalContractAddress);
-    
-    // Step 2: Generate price timeline for all tokens using the WOX token as reference
-    const tokenPrices = generateTokenPriceTimeline(swapEvents, woxAddress);
-    
-    // Step 3: Format the response
-    const result = {
-    //   universalContract: universalContractAddress,
-    //   woxToken: woxAddress,
-    //   eventCount: swapEvents.length,
-    //   tokenCount: Object.keys(tokenPrices).length,
-      // Include the most recent price for each token
-    //   latestPrices: Object.entries(tokenPrices).reduce((acc, [token, pricePoints]) => {
-    //     if (pricePoints.length > 0) {
-    //       acc[token] = {
-    //         price: pricePoints[0].price,
-    //         time: pricePoints[0].time,
-    //         timeFormatted: pricePoints[0].timeFormatted
-    //       };
-    //     }
-    //     return acc;
-    //   }, {}),
-      // Include full price history
-      priceHistory: tokenPrices
-    };
-    
-    return res.json(result);
-  } catch (error) {
-    console.error('Error processing request:', error);
-    return res.status(500).json({
-      error: 'Failed to process request',
-      details: error.message,
-      stack: error.stack
-    });
-  }
-});
-
 // Add a test endpoint to check if the contract exists and has code
 app.get('/check-contract/:address', async (req, res) => {
   try {
@@ -478,6 +554,9 @@ app.get('/check-contract/:address', async (req, res) => {
 // Token transactions endpoint from the other script
 app.post('/token-transactions', async (req, res) => {
   const { tokenAddresses, userAddress } = req.body;
+
+  // Print log in red color
+  console.log('\x1b[31m%s\x1b[0m', 'Received request for token transactions:', { tokenAddresses, userAddress });
   
   // Validate input
   if (!userAddress || !web3.utils.isAddress(userAddress)) {
@@ -589,12 +668,20 @@ app.post('/token-transactions', async (req, res) => {
     // Sort transactions by timestamp (descending)
     allTransactions.sort((a, b) => b.timestamp - a.timestamp);
     
-    return res.json({
-      userAddress: normalizedUserAddress,
-      tokenCount: validTokenAddresses.length,
-      transactionCount: allTransactions.length,
-      transactions: allTransactions
-    });
+    // Limit to latest 20 transactions
+    const latestTransactions = allTransactions.slice(0, 20);
+
+    console.log(`🔢 AFTER: ${latestTransactions.length} transactions`);
+    console.log(`✅ Limit working: ${latestTransactions.length <= 20 ? 'YES' : 'NO'}`);
+
+
+  return res.json({
+    userAddress: normalizedUserAddress,
+    tokenCount: validTokenAddresses.length,
+    transactionCount: latestTransactions.length,
+    totalTransactionsFound: allTransactions.length, // Show total found
+    transactions: latestTransactions // Return only latest 20
+  });
   } catch (error) {
     console.error('Error fetching token transactions:', error);
     return res.status(500).json({
@@ -604,12 +691,56 @@ app.post('/token-transactions', async (req, res) => {
   }
 });
 
-// Start the server
-app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
-  console.log(`Available endpoints:`);
-  console.log(`  GET /token-graphs`);
-  console.log(`  GET /check-contract/:address`);
-  console.log(`  POST /token-transactions`);
-  console.log(`Example: http://localhost:${port}/token-graphs?universalContract=0xd95CA891eCfF265ACf2177651965a85d3B9F9a96&woxAddress=0xb9A219631Aed55eBC3D998f17C3840B7eC39C0cc`);
+// Start the background service and server
+async function startService() {
+  console.log(`🚀 Starting Token Graphs Service...`);
+  
+  // Try to load existing data from file
+  const dataLoaded = await loadDataFromFile();
+  
+  // If no existing data, do initial update
+  if (!dataLoaded) {
+    console.log(`📊 No existing data found. Performing initial update...`);
+    await updateDataInBackground();
+  }
+  
+  // Start continuous background updates every 2 minutes
+  setInterval(async () => {
+    console.log(`⏰ Scheduled update triggered`);
+    await updateDataInBackground();
+  }, UPDATE_INTERVAL);
+  
+  console.log(`⏰ Background service started - updating every ${UPDATE_INTERVAL / 1000 / 60} minutes`);
+  
+  // Start Express server
+  app.listen(port, () => {
+    console.log(`🌟 Server running on port ${port}`);
+    console.log(`📋 Available endpoints:`);
+    console.log(`  GET  /token-graphs (instant from cache)`);
+    console.log(`  POST /token-transactions`);
+    console.log(`  POST /token-balances`);
+    console.log(`  GET  /check-contract/:address`);
+    console.log(`📁 Cache file: ${CACHE_FILE_PATH}`);
+    console.log(`🔄 Auto-update: Every 2 minutes`);
+    console.log(`✅ Service ready!`);
+  });
+}
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  console.log(`\n🛑 Shutting down service...`);
+  if (dataCache.tokenGraphs) {
+    await fs.writeFile(CACHE_FILE_PATH, JSON.stringify({
+      tokenGraphs: dataCache.tokenGraphs,
+      lastUpdated: dataCache.lastUpdated
+    }, null, 2));
+    console.log(`💾 Final data saved to file`);
+  }
+  process.exit(0);
+});
+
+// Start the service
+startService().catch(error => {
+  console.error(`❌ Failed to start service:`, error);
+  process.exit(1);
 });
